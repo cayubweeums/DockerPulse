@@ -55,6 +55,8 @@ COPY --from=backend-builder /dockerpulse /usr/local/bin/dockerpulse
 # Default data directory
 RUN mkdir -p /data /root/docker
 
+ARG GITHUB_REPOSITORY=farmers00/dockerpulse
+ENV GITHUB_REPOSITORY=$GITHUB_REPOSITORY
 ENV PORT=8080
 ENV DATA_DIR=/data
 

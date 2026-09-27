@@ -54,6 +54,8 @@ jobs:
           context: .
           file: deploy/Dockerfile
           platforms: linux/amd64,linux/arm64,linux/arm/v7
+          build-args: |
+            GITHUB_REPOSITORY=${{ github.repository }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -18,6 +18,7 @@ export const DeployAgentModal: React.FC<DeployAgentModalProps> = ({
 }) => {
   const [nodeName, setNodeName] = useState('remote-node-1');
   const [agentToken, setAgentToken] = useState('fetching...');
+  const [agentImage, setAgentImage] = useState('ghcr.io/farmers00/dockerpulse:latest');
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<'curl' | 'compose' | 'git'>('curl');
 
@@ -34,6 +35,9 @@ export const DeployAgentModal: React.FC<DeployAgentModalProps> = ({
       .then((data) => {
         if (data.token) {
           setAgentToken(data.token);
+        }
+        if (data.image) {
+          setAgentImage(data.image);
         }
       })
       .catch(() => {
@@ -93,7 +97,7 @@ export const DeployAgentModal: React.FC<DeployAgentModalProps> = ({
 cat << 'EOF' > docker-compose.yml
 services:
   dockerpulse-agent:
-    image: ghcr.io/farmers00/dockerpulse:latest
+    image: ${agentImage}
     container_name: dockerpulse-agent
     restart: unless-stopped
     volumes:
