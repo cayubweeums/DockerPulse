@@ -1,7 +1,7 @@
 # ==========================================
 # Stage 1: Build Frontend Assets
 # ==========================================
-FROM node:22-alpine AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 WORKDIR /app/frontend
 
 COPY frontend/package*.json ./
@@ -13,8 +13,12 @@ RUN npm run build
 # ==========================================
 # Stage 2: Build Go Binary with Embedded UI
 # ==========================================
-FROM golang:1.22-alpine AS backend-builder
+FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS backend-builder
 WORKDIR /app/backend
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates
@@ -26,8 +30,9 @@ COPY backend/ ./
 # Copy built frontend dist into backend internal static embed dir
 COPY --from=frontend-builder /app/frontend/dist ./internal/api/dist
 
-# Build single static binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /dockerpulse ./cmd/dockerpulse
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    GOARM=${TARGETVARIANT#v} \
+    go build -ldflags="-s -w" -o /dockerpulse ./cmd/dockerpulse
 
 # ==========================================
 # Stage 3: Minimal Production Image
