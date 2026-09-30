@@ -328,7 +328,15 @@ TOKEN="%s"
 WS_URL="%s"
 SERVER_URL="%s"
 
-TARGET_DIR="$(pwd)/dockerpulse-agent"
+ACTUAL_USER="$USER"
+if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+  ACTUAL_USER="$SUDO_USER"
+fi
+USER_HOME=$(getent passwd "$ACTUAL_USER" 2>/dev/null | cut -d: -f6)
+if [ -z "$USER_HOME" ]; then
+  USER_HOME="$HOME"
+fi
+TARGET_DIR="${TARGET_DIR:-$USER_HOME/docker/dockerpulse-agent}"
 
 echo "[DockerPulse] Host ID:     $HOST_ID"
 echo "[DockerPulse] Server URL:  $SERVER_URL"

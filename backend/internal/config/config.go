@@ -55,9 +55,13 @@ func LoadConfig() *Config {
 		updateInterval = u
 	}
 
-	image := "ghcr.io/farmers00/dockerpulse:latest"
-	if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {
-		image = "ghcr.io/" + strings.ToLower(repo) + ":latest"
+	image := os.Getenv("AGENT_IMAGE")
+	if image == "" {
+		if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {
+			image = "ghcr.io/" + strings.ToLower(repo) + ":latest"
+		} else {
+			image = "ghcr.io/farmers00/dockerpulse:latest"
+		}
 	}
 
 	return &Config{
