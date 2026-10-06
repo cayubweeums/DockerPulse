@@ -174,4 +174,49 @@ export const api = {
     const token = localStorage.getItem('dockpulse_token') || '';
     return `${protocol}//${host}/api/hosts/${hostId}/containers/${containerId}/terminal?token=${token}`;
   },
+
+  // In-App Notifications
+  listNotifications: (limit = 100) => request<import('../types').InAppNotification[]>(`/notifications?limit=${limit}`),
+  getUnreadNotificationCount: () => request<{ unread_count: number }>('/notifications/unread-count'),
+  markNotificationRead: (id: string) => request<void>(`/notifications/${id}/read`, { method: 'POST' }),
+  markAllNotificationsRead: () => request<void>('/notifications/read-all', { method: 'POST' }),
+  dismissNotification: (id: string) => request<void>(`/notifications/${id}`, { method: 'DELETE' }),
+  clearAllNotifications: () => request<void>('/notifications', { method: 'DELETE' }),
+
+  // Settings: Profile & Account
+  getProfile: () => request<import('../types').User>('/settings/profile'),
+  updateProfile: (data: { display_name: string; username: string; avatar?: string; theme?: string }) =>
+    request<any>('/settings/profile', { method: 'PUT', body: JSON.stringify(data) }),
+  changePassword: (data: { current_password: string; new_password: string }) =>
+    request<any>('/settings/password', { method: 'PUT', body: JSON.stringify(data) }),
+
+  // Settings: Notifications (ntfy, discord, signal)
+  getNotificationConfigs: () => request<import('../types').NotificationConfig[]>('/settings/notifications'),
+  saveNotificationConfig: (service: string, data: { enabled: boolean; config_json: string }) =>
+    request<import('../types').NotificationConfig>(`/settings/notifications/${service}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  testNotification: (service: string, config_json?: string) =>
+    request<{ message: string }>(`/settings/notifications/${service}/test`, {
+      method: 'POST',
+      body: JSON.stringify({ config_json: config_json || '{}' }),
+    }),
+
+  // Settings: Scheduler
+  getSchedulerConfig: () => request<import('../types').SchedulerConfig>('/settings/scheduler'),
+  saveSchedulerConfig: (data: { enabled: boolean; interval_minutes: number }) =>
+    request<import('../types').SchedulerConfig>('/settings/scheduler', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  triggerSchedulerCheck: () => request<{ message: string }>('/settings/scheduler/run', { method: 'POST' }),
+
+  // User Management
+  listUsers: () => request<import('../types').ManagedUser[]>('/users'),
+  createUser: (data: { username: string; password: string; display_name?: string; role: 'admin' | 'viewer' }) =>
+    request<import('../types').ManagedUser>('/users', { method: 'POST', body: JSON.stringify(data) }),
+  updateUser: (id: string, data: { display_name?: string; role?: 'admin' | 'viewer'; password?: string }) =>
+    request<any>(`/users/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteUser: (id: string) => request<any>(`/users/${id}`, { method: 'DELETE' }),
 };

@@ -61,7 +61,36 @@ type User struct {
 	Username     string    `json:"username"`
 	PasswordHash string    `json:"-"`
 	Role         UserRole  `json:"role"`
+	DisplayName  string    `json:"display_name"`
+	Avatar       string    `json:"avatar"`
+	Theme        string    `json:"theme"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+type Notification struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Message   string    `json:"message"`
+	Type      string    `json:"type"` // "update", "info", "warning", "error"
+	HostID    string    `json:"host_id,omitempty"`
+	Read      bool      `json:"read"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type NotificationConfig struct {
+	ID         string    `json:"id"` // "ntfy", "discord", "signal"
+	Enabled    bool      `json:"enabled"`
+	ConfigJSON string    `json:"config_json"`
+	Status     string    `json:"status"` // "unconfigured", "enabled", "error"
+	LastError  string    `json:"last_error,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+type SchedulerConfig struct {
+	Enabled         bool      `json:"enabled"`
+	IntervalMinutes int       `json:"interval_minutes"`
+	LastRun         time.Time `json:"last_run"`
+	NextRun         time.Time `json:"next_run"`
 }
 
 type UpdateCheck struct {

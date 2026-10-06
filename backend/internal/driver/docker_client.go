@@ -16,8 +16,9 @@ import (
 )
 
 type DockerClient struct {
-	httpClient *http.Client
-	baseURL    string
+	httpClient  *http.Client
+	baseURL     string
+	hostAddress string
 }
 
 func NewDockerClient(hostAddress string) (*DockerClient, error) {
@@ -41,8 +42,9 @@ func NewDockerClient(hostAddress string) (*DockerClient, error) {
 			return nil, err
 		}
 		return &DockerClient{
-			httpClient: &http.Client{Transport: tr, Timeout: 30 * time.Second},
-			baseURL:    u.String(),
+			httpClient:  &http.Client{Transport: tr, Timeout: 30 * time.Second},
+			baseURL:     u.String(),
+			hostAddress: hostAddress,
 		}, nil
 	}
 
@@ -52,9 +54,27 @@ func NewDockerClient(hostAddress string) (*DockerClient, error) {
 	}
 
 	return &DockerClient{
-		httpClient: &http.Client{Transport: tr},
-		baseURL:    "http://docker",
+		httpClient:  &http.Client{Transport: tr},
+		baseURL:     "http://docker",
+		hostAddress: hostAddress,
 	}, nil
+}
+
+func (c *DockerClient) Dial(ctx context.Context) (net.Conn, error) {
+	if strings.HasPrefix(c.hostAddress, "tcp://") || strings.HasPrefix(c.hostAddress, "http://") || strings.HasPrefix(c.hostAddress, "https://") {
+		clean := strings.TrimPrefix(c.hostAddress, "tcp://")
+		if !strings.HasPrefix(clean, "http") {
+			clean = "http://" + clean
+		}
+		u, err := url.Parse(clean)
+		if err != nil {
+			return nil, err
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", u.Host)
+	}
+
+	return dialDockerSocket(ctx, c.hostAddress)
 }
 
 func (c *DockerClient) Get(ctx context.Context, path string, out interface{}) error {

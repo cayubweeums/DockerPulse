@@ -180,3 +180,93 @@ func TestGetComposeProjectName(t *testing.T) {
 	}
 }
 
+func TestParseEnvFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, ".env")
+
+	content := `
+# Configuration file
+PORT=8081
+DATA_DIR=/custom/data # inline comment
+export JWT_SECRET="super-secret-key"
+SINGLE_QUOTED='single-quoted'
+EMPTY_VAL=
+`
+	if err := os.WriteFile(envPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test .env file: %v", err)
+	}
+
+	envMap := parseEnvFile(envPath)
+	if envMap["PORT"] != "8081" {
+		t.Errorf("expected PORT=8081, got %q", envMap["PORT"])
+	}
+	if envMap["DATA_DIR"] != "/custom/data" {
+		t.Errorf("expected DATA_DIR=/custom/data, got %q", envMap["DATA_DIR"])
+	}
+	if envMap["JWT_SECRET"] != "super-secret-key" {
+		t.Errorf("expected JWT_SECRET=super-secret-key, got %q", envMap["JWT_SECRET"])
+	}
+	if envMap["SINGLE_QUOTED"] != "single-quoted" {
+		t.Errorf("expected SINGLE_QUOTED=single-quoted, got %q", envMap["SINGLE_QUOTED"])
+	}
+	if _, ok := envMap["EMPTY_VAL"]; !ok {
+		t.Errorf("expected EMPTY_VAL to be present in map")
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	if got := shellQuote("simple"); got != "'simple'" {
+		t.Errorf("expected 'simple', got %s", got)
+	}
+	if got := shellQuote("with spaces"); got != "'with spaces'" {
+		t.Errorf("expected 'with spaces', got %s", got)
+	}
+	if got := shellQuote("it's cool"); got != "'it'\\''s cool'" {
+		t.Errorf("expected 'it'\\''s cool', got %s", got)
+	}
+}
+
+func TestBuildComposeEnv(t *testing.T) {
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, ".env")
+	_ = os.WriteFile(envPath, []byte("PORT=8081\nFOO=bar\n"), 0644)
+
+	// Simulate DockerPulse internal process env
+	t.Setenv("PORT", "8080")
+	t.Setenv("DATA_DIR", "/data")
+	t.Setenv("JWT_SECRET", "internal_secret")
+	t.Setenv("OTHER_VAR", "keep_me")
+
+	cleanEnv := buildComposeEnv(tmpDir)
+
+	envMap := make(map[string]string)
+	for _, e := range cleanEnv {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
+		}
+	}
+
+	// Internal vars should be stripped if not in .env
+	if _, ok := envMap["DATA_DIR"]; ok {
+		t.Errorf("DATA_DIR should have been stripped from compose env")
+	}
+	if _, ok := envMap["JWT_SECRET"]; ok {
+		t.Errorf("JWT_SECRET should have been stripped from compose env")
+	}
+
+	// Non-internal env vars should be retained
+	if envMap["OTHER_VAR"] != "keep_me" {
+		t.Errorf("expected OTHER_VAR=keep_me, got %q", envMap["OTHER_VAR"])
+	}
+
+	// User-defined variables in .env should override internal vars
+	if envMap["PORT"] != "8081" {
+		t.Errorf("expected PORT=8081 from .env, got %q", envMap["PORT"])
+	}
+	if envMap["FOO"] != "bar" {
+		t.Errorf("expected FOO=bar from .env, got %q", envMap["FOO"])
+	}
+}
+
+

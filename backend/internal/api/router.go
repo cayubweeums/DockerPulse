@@ -10,6 +10,7 @@ import (
 	"github.com/dockpulse/dockmgr/internal/config"
 	"github.com/dockpulse/dockmgr/internal/database"
 	"github.com/dockpulse/dockmgr/internal/driver"
+	"github.com/dockpulse/dockmgr/internal/notifications"
 	"github.com/dockpulse/dockmgr/internal/updater"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -21,16 +22,22 @@ type Server struct {
 	db           *database.DB
 	agentManager *driver.AgentManager
 	updater      *updater.UpdateChecker
+	dispatcher   *notifications.Dispatcher
+	scheduler    *notifications.Scheduler
 	upgrader     websocket.Upgrader
 	frontendFS   fs.FS
 }
 
 func NewServer(cfg *config.Config, db *database.DB, frontendFS fs.FS) *Server {
-	return &Server{
+	dispatcher := notifications.NewDispatcher(db)
+	updateChecker := updater.NewUpdateChecker(db)
+
+	s := &Server{
 		cfg:          cfg,
 		db:           db,
 		agentManager: driver.NewAgentManager(),
-		updater:      updater.NewUpdateChecker(db),
+		updater:      updateChecker,
+		dispatcher:   dispatcher,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Homelab / multi-origin friendly
@@ -38,6 +45,11 @@ func NewServer(cfg *config.Config, db *database.DB, frontendFS fs.FS) *Server {
 		},
 		frontendFS: frontendFS,
 	}
+
+	s.scheduler = notifications.NewScheduler(db, dispatcher, updateChecker, s.GetDriver)
+	s.scheduler.Start()
+
+	return s
 }
 
 func (s *Server) GetDriver(ctx context.Context, host *database.Host) (driver.HostDriver, error) {
@@ -130,6 +142,35 @@ func (s *Server) SetupRouter() *gin.Engine {
 
 		// Image Updates
 		api.GET("/hosts/:id/updates/check", s.handleCheckUpdates)
+
+		// Notifications (In-App Drawer)
+		api.GET("/notifications", s.handleListNotifications)
+		api.GET("/notifications/unread-count", s.handleGetUnreadNotificationCount)
+		api.POST("/notifications/:id/read", s.handleMarkNotificationRead)
+		api.POST("/notifications/read-all", s.handleMarkAllNotificationsRead)
+		api.DELETE("/notifications/:id", s.handleDeleteNotification)
+		api.DELETE("/notifications", s.handleClearAllNotifications)
+
+		// Settings: Profile & Account
+		api.GET("/settings/profile", s.handleGetProfile)
+		api.PUT("/settings/profile", s.handleUpdateProfile)
+		api.PUT("/settings/password", s.handleChangePassword)
+
+		// Settings: External Notification Services (ntfy, discord, signal)
+		api.GET("/settings/notifications", s.handleGetNotificationConfigs)
+		api.PUT("/settings/notifications/:service", s.handleSaveNotificationConfig)
+		api.POST("/settings/notifications/:service/test", s.handleTestNotification)
+
+		// Settings: Background Update Scheduler
+		api.GET("/settings/scheduler", s.handleGetSchedulerConfig)
+		api.PUT("/settings/scheduler", s.handleSaveSchedulerConfig)
+		api.POST("/settings/scheduler/run", s.handleTriggerScheduler)
+
+		// User Management (Admin Only)
+		api.GET("/users", s.handleListUsers)
+		api.POST("/users", s.handleCreateUser)
+		api.PUT("/users/:id", s.handleUpdateUser)
+		api.DELETE("/users/:id", s.handleDeleteUser)
 	}
 
 	// Serve Frontend SPA if embedded

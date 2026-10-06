@@ -67,7 +67,6 @@ services:
       # Mount your host's docker compose directory (e.g. ~/docker)
       - ${HOME}/docker:/root/docker
     environment:
-      - PORT=8080
       - DATA_DIR=/data
       - JWT_SECRET=${JWT_SECRET:-change_me_to_a_secure_random_string_in_production}
       - AGENT_SECRET=${AGENT_SECRET:-dockerpulse_agent_shared_join_token_2026}

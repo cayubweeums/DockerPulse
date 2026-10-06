@@ -100,4 +100,43 @@ export interface User {
   id: string;
   username: string;
   role: 'admin' | 'viewer';
+  display_name?: string;
+  avatar?: string;
+  theme?: string;
+}
+
+export interface InAppNotification {
+  id: string;
+  title: string;
+  message: string;
+  type: 'update' | 'info' | 'warning' | 'error';
+  host_id?: string;
+  read: boolean;
+  created_at: string;
+}
+
+export interface NotificationConfig {
+  id: 'ntfy' | 'discord' | 'signal';
+  enabled: boolean;
+  config_json: string;
+  status: 'unconfigured' | 'enabled' | 'error';
+  last_error?: string;
+  updated_at: string;
+}
+
+export interface SchedulerConfig {
+  enabled: boolean;
+  interval_minutes: number;
+  last_run: string;
+  next_run: string;
+}
+
+export interface ManagedUser {
+  id: string;
+  username: string;
+  display_name: string;
+  avatar?: string;
+  theme?: string;
+  role: 'admin' | 'viewer';
+  created_at: string;
 }

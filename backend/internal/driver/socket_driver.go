@@ -1,10 +1,13 @@
 package driver
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,11 +22,30 @@ type hostMount struct {
 	Destination string
 }
 
+type cpuSample struct {
+	TotalUsage  uint64
+	SystemUsage uint64
+	Timestamp   time.Time
+}
+
+type containerStatsSnapshot struct {
+	CPUPct      float64
+	MemoryMB    float64
+	MemoryPct   float64
+	NetInputMB  float64
+	NetOutputMB float64
+	UpdatedAt   time.Time
+}
+
 type SocketDriver struct {
 	client     *DockerClient
 	mountsMu   sync.Mutex
 	mounts     []hostMount
 	mountsInit bool
+
+	cpuMu     sync.Mutex
+	prevCPUs  map[string]cpuSample
+	lastStats map[string]containerStatsSnapshot
 }
 
 func NewSocketDriver(hostAddress string) (*SocketDriver, error) {
@@ -31,7 +53,11 @@ func NewSocketDriver(hostAddress string) (*SocketDriver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
 	}
-	return &SocketDriver{client: c}, nil
+	return &SocketDriver{
+		client:    c,
+		prevCPUs:  make(map[string]cpuSample),
+		lastStats: make(map[string]containerStatsSnapshot),
+	}, nil
 }
 
 func (d *SocketDriver) Ping(ctx context.Context) error {
@@ -233,16 +259,32 @@ func (d *SocketDriver) ListContainers(ctx context.Context) ([]ContainerInfo, err
 		result = append(result, info)
 	}
 
-	// Fetch quick stats in parallel for running containers with a 1.5s overall cap
+	// Fetch quick stats in parallel for running containers with worker concurrency pool
 	var wg sync.WaitGroup
-	statsCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	statsCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
+	sem := make(chan struct{}, 8)
 
 	for i := range result {
 		if result[i].State == "running" {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-statsCtx.Done():
+					d.cpuMu.Lock()
+					if cached, ok := d.lastStats[result[idx].ID]; ok {
+						result[idx].CPUPct = cached.CPUPct
+						result[idx].MemoryMB = cached.MemoryMB
+						result[idx].MemoryPct = cached.MemoryPct
+						result[idx].NetInputMB = cached.NetInputMB
+						result[idx].NetOutputMB = cached.NetOutputMB
+					}
+					d.cpuMu.Unlock()
+					return
+				}
 				d.populateContainerStats(statsCtx, result[idx].ID, &result[idx])
 			}(i)
 		}
@@ -252,8 +294,22 @@ func (d *SocketDriver) ListContainers(ctx context.Context) ([]ContainerInfo, err
 	return result, nil
 }
 
+func parseUint64(v interface{}) uint64 {
+	switch val := v.(type) {
+	case float64:
+		return uint64(val)
+	case int64:
+		return uint64(val)
+	case uint64:
+		return val
+	case int:
+		return uint64(val)
+	}
+	return 0
+}
+
 func (d *SocketDriver) populateContainerStats(ctx context.Context, id string, info *ContainerInfo) {
-	statsCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	statsCtx, cancel := context.WithTimeout(ctx, 3500*time.Millisecond)
 	defer cancel()
 
 	var stats struct {
@@ -279,34 +335,134 @@ func (d *SocketDriver) populateContainerStats(ctx context.Context, id string, in
 			RxBytes uint64 `json:"rx_bytes"`
 			TxBytes uint64 `json:"tx_bytes"`
 		} `json:"networks"`
+		Network struct {
+			RxBytes uint64 `json:"rx_bytes"`
+			TxBytes uint64 `json:"tx_bytes"`
+		} `json:"network"`
 	}
 
-	if err := d.client.Get(statsCtx, fmt.Sprintf("/containers/%s/stats?stream=false", id), &stats); err != nil {
+	// First attempt with one-shot=true for instantaneous return without 1-second CPU delta blocking
+	err := d.client.Get(statsCtx, fmt.Sprintf("/containers/%s/stats?stream=false&one-shot=true", id), &stats)
+	if err != nil {
+		// Fallback to standard stream=false if one-shot is rejected or fails
+		err = d.client.Get(statsCtx, fmt.Sprintf("/containers/%s/stats?stream=false", id), &stats)
+	}
+
+	if err != nil {
+		// If transient failure or timeout, fallback to last known good stats
+		d.cpuMu.Lock()
+		if cached, ok := d.lastStats[id]; ok {
+			info.CPUPct = cached.CPUPct
+			info.MemoryMB = cached.MemoryMB
+			info.MemoryPct = cached.MemoryPct
+			info.NetInputMB = cached.NetInputMB
+			info.NetOutputMB = cached.NetOutputMB
+		}
+		d.cpuMu.Unlock()
 		return
 	}
 
-	cpuDelta := float64(stats.CPUStats.CPUUsage.TotalUsage) - float64(stats.PreCPUStats.CPUUsage.TotalUsage)
-	systemDelta := float64(stats.CPUStats.SystemUsage) - float64(stats.PreCPUStats.SystemUsage)
+	currentTotal := stats.CPUStats.CPUUsage.TotalUsage
+	currentSystem := stats.CPUStats.SystemUsage
 	onlineCPUs := float64(stats.CPUStats.OnlineCPUs)
 	if onlineCPUs == 0 {
 		onlineCPUs = 1
 	}
 
+	d.cpuMu.Lock()
+	if d.prevCPUs == nil {
+		d.prevCPUs = make(map[string]cpuSample)
+	}
+	prev, hasPrev := d.prevCPUs[id]
+	d.prevCPUs[id] = cpuSample{
+		TotalUsage:  currentTotal,
+		SystemUsage: currentSystem,
+		Timestamp:   time.Now(),
+	}
+	d.cpuMu.Unlock()
+
+	var cpuDelta float64
+	var systemDelta float64
+
+	if hasPrev && prev.TotalUsage > 0 && currentTotal >= prev.TotalUsage {
+		cpuDelta = float64(currentTotal - prev.TotalUsage)
+		if currentSystem > prev.SystemUsage {
+			systemDelta = float64(currentSystem - prev.SystemUsage)
+		} else {
+			elapsedNano := time.Since(prev.Timestamp).Nanoseconds()
+			if elapsedNano > 0 {
+				systemDelta = float64(elapsedNano)
+			}
+		}
+	} else if stats.PreCPUStats.CPUUsage.TotalUsage > 0 && stats.PreCPUStats.SystemUsage > 0 {
+		cpuDelta = float64(currentTotal) - float64(stats.PreCPUStats.CPUUsage.TotalUsage)
+		systemDelta = float64(currentSystem) - float64(stats.PreCPUStats.SystemUsage)
+	}
+
 	if systemDelta > 0 && cpuDelta > 0 {
 		cpuPct := (cpuDelta / systemDelta) * onlineCPUs * 100.0
-		info.CPUPct = float64(int(cpuPct*100)) / 100
+		if cpuPct > onlineCPUs*100.0 {
+			cpuPct = onlineCPUs * 100.0
+		}
+		info.CPUPct = math.Round(cpuPct*10) / 10
+	} else {
+		info.CPUPct = 0.0
 	}
 
+	// Memory usage: match Docker CLI by subtracting inactive_file / cache
 	usedMem := stats.MemoryStats.Usage
-	info.MemoryMB = float64(usedMem) / (1024 * 1024)
-	if stats.MemoryStats.Limit > 0 {
-		info.MemoryPct = float64(int((float64(usedMem)/float64(stats.MemoryStats.Limit))*10000)) / 100
+	if statsMap := stats.MemoryStats.Stats; statsMap != nil {
+		if usedMem == 0 {
+			anon := parseUint64(statsMap["anon"])
+			file := parseUint64(statsMap["file"])
+			usedMem = anon + file
+		}
+		var cache uint64
+		if v, ok := statsMap["inactive_file"]; ok {
+			cache = parseUint64(v)
+		} else if v, ok := statsMap["total_inactive_file"]; ok {
+			cache = parseUint64(v)
+		} else if v, ok := statsMap["cache"]; ok {
+			cache = parseUint64(v)
+		}
+		if cache < usedMem {
+			usedMem -= cache
+		}
 	}
 
+	info.MemoryMB = math.Round((float64(usedMem)/(1024*1024))*10) / 10
+	if stats.MemoryStats.Limit > 0 {
+		pct := (float64(usedMem) / float64(stats.MemoryStats.Limit)) * 100.0
+		info.MemoryPct = math.Round(pct*10) / 10
+	}
+
+	info.NetInputMB = 0
+	info.NetOutputMB = 0
 	for _, n := range stats.Networks {
 		info.NetInputMB += float64(n.RxBytes) / (1024 * 1024)
 		info.NetOutputMB += float64(n.TxBytes) / (1024 * 1024)
 	}
+	if len(stats.Networks) == 0 && (stats.Network.RxBytes > 0 || stats.Network.TxBytes > 0) {
+		info.NetInputMB = float64(stats.Network.RxBytes) / (1024 * 1024)
+		info.NetOutputMB = float64(stats.Network.TxBytes) / (1024 * 1024)
+	}
+	info.NetInputMB = math.Round(info.NetInputMB*10) / 10
+	info.NetOutputMB = math.Round(info.NetOutputMB*10) / 10
+
+	// Save to lastStats cache
+	d.cpuMu.Lock()
+	if d.lastStats == nil {
+		d.lastStats = make(map[string]containerStatsSnapshot)
+	}
+	d.lastStats[id] = containerStatsSnapshot{
+		CPUPct:      info.CPUPct,
+		MemoryMB:    info.MemoryMB,
+		MemoryPct:   info.MemoryPct,
+		NetInputMB:  info.NetInputMB,
+		NetOutputMB: info.NetOutputMB,
+		UpdatedAt:   time.Now(),
+	}
+	d.cpuMu.Unlock()
 }
 
 func (d *SocketDriver) StartContainer(ctx context.Context, id string) error {
@@ -334,17 +490,189 @@ func (d *SocketDriver) StreamLogs(ctx context.Context, containerID string, follo
 }
 
 func (d *SocketDriver) ExecShell(ctx context.Context, containerID string, cmd []string, in io.Reader, out io.Writer, resizeChan <-chan TerminalSize) error {
-	if len(cmd) == 0 {
-		cmd = []string{"/bin/sh"}
+	// Candidate shells to try if using default shell
+	var shellCandidates [][]string
+	if len(cmd) > 0 && !(len(cmd) == 1 && cmd[0] == "/bin/sh") {
+		shellCandidates = [][]string{cmd}
+	} else {
+		shellCandidates = [][]string{
+			{"/bin/sh"},
+			{"/bin/bash"},
+			{"sh"},
+		}
 	}
 
-	// Local exec fallback using docker exec directly
-	args := append([]string{"exec", "-i", "-t", containerID}, cmd...)
+	var lastErr error
+	for _, candidateCmd := range shellCandidates {
+		err := d.runExec(ctx, containerID, candidateCmd, in, out, resizeChan)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		// If error is not executable not found, don't keep retrying other shells
+		errLower := strings.ToLower(err.Error())
+		if !strings.Contains(errLower, "executable file not found") && !strings.Contains(errLower, "no such file") {
+			break
+		}
+	}
+
+	if lastErr != nil {
+		errLower := strings.ToLower(lastErr.Error())
+		if strings.Contains(errLower, "executable file not found") || strings.Contains(errLower, "no such file") {
+			_, _ = fmt.Fprintf(out, "\r\n\x1b[33m[DockerPulse] Notice: No shell (/bin/sh or /bin/bash) found in container.\x1b[0m\r\n\x1b[90mThis container is likely built 'FROM scratch' (such as Watchtower or static Go/Rust binaries) and does not have an interactive shell environment.\x1b[0m\r\n")
+		}
+	}
+	return lastErr
+}
+
+func (d *SocketDriver) runExec(ctx context.Context, containerID string, cmd []string, in io.Reader, out io.Writer, resizeChan <-chan TerminalSize) error {
+	// 1. Try native Docker Engine API exec first (handles PTY/TTY properly over socket/TCP)
+	err := d.runDockerAPIExec(ctx, containerID, cmd, in, out, resizeChan)
+	if err == nil {
+		return nil
+	}
+
+	// If the shell binary does not exist in the container, do not attempt fallback
+	errLower := strings.ToLower(err.Error())
+	if strings.Contains(errLower, "executable file not found") || strings.Contains(errLower, "no such file") {
+		return err
+	}
+
+	// 2. Subprocess fallback using 'docker exec -i' (WITHOUT -t to avoid "the input device is not a TTY")
+	args := append([]string{"exec", "-i", containerID}, cmd...)
 	execCmd := exec.CommandContext(ctx, "docker", args...)
 	execCmd.Stdin = in
 	execCmd.Stdout = out
 	execCmd.Stderr = out
 	return execCmd.Run()
+}
+
+func (d *SocketDriver) runDockerAPIExec(ctx context.Context, containerID string, cmd []string, in io.Reader, out io.Writer, resizeChan <-chan TerminalSize) error {
+	type execConfig struct {
+		AttachStdin  bool     `json:"AttachStdin"`
+		AttachStdout bool     `json:"AttachStdout"`
+		AttachStderr bool     `json:"AttachStderr"`
+		Tty          bool     `json:"Tty"`
+		Cmd          []string `json:"Cmd"`
+	}
+
+	var execResp struct {
+		ID string `json:"Id"`
+	}
+
+	createPayload := execConfig{
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          true,
+		Cmd:          cmd,
+	}
+
+	if err := d.client.Post(ctx, fmt.Sprintf("/containers/%s/exec", containerID), createPayload, &execResp); err != nil {
+		return fmt.Errorf("failed to create exec: %w", err)
+	}
+
+	execID := execResp.ID
+
+	// Dial Docker daemon directly for raw hijacked stream
+	conn, err := d.client.Dial(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to dial docker socket: %w", err)
+	}
+	defer conn.Close()
+
+	reqBody := `{"Detach":false,"Tty":true}`
+	reqStr := fmt.Sprintf("POST /exec/%s/start HTTP/1.1\r\n"+
+		"Host: docker\r\n"+
+		"User-Agent: Docker-Client\r\n"+
+		"Content-Type: application/json\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Upgrade: tcp\r\n"+
+		"Content-Length: %d\r\n\r\n%s", execID, len(reqBody), reqBody)
+
+	if _, err := conn.Write([]byte(reqStr)); err != nil {
+		return fmt.Errorf("failed to send exec start request: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: "POST"})
+	if err != nil {
+		return fmt.Errorf("failed to read exec start response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusSwitchingProtocols && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("exec start returned status %d: %s", resp.StatusCode, string(b))
+	}
+
+	// Handle PTY resize events in background
+	resizeCtx, cancelResize := context.WithCancel(ctx)
+	defer cancelResize()
+	go func() {
+		for {
+			select {
+			case <-resizeCtx.Done():
+				return
+			case size, ok := <-resizeChan:
+				if !ok {
+					return
+				}
+				if size.Rows > 0 && size.Cols > 0 {
+					_ = d.client.Post(resizeCtx, fmt.Sprintf("/exec/%s/resize?h=%d&w=%d", execID, size.Rows, size.Cols), nil, nil)
+				}
+			}
+		}
+	}()
+
+	// Probe initial output with short read deadline to detect immediate exit / missing executable
+	initialBuf := make([]byte, 512)
+	_ = conn.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
+	n, readErr := br.Read(initialBuf)
+	_ = conn.SetReadDeadline(time.Time{})
+
+	if n > 0 {
+		initialOutput := string(initialBuf[:n])
+		lower := strings.ToLower(initialOutput)
+		if strings.Contains(lower, "executable file not found") || strings.Contains(lower, "no such file") {
+			return errors.New(strings.TrimSpace(initialOutput))
+		}
+		// Write valid initial output to terminal
+		if _, err := out.Write(initialBuf[:n]); err != nil {
+			return err
+		}
+	} else if readErr != nil && !errors.Is(readErr, os.ErrDeadlineExceeded) && !strings.Contains(readErr.Error(), "timeout") {
+		// Connection closed immediately; inspect exit code
+		var inspectResp struct {
+			ExitCode int  `json:"ExitCode"`
+			Running  bool `json:"Running"`
+		}
+		if d.client.Get(ctx, fmt.Sprintf("/exec/%s/json", execID), &inspectResp) == nil {
+			if inspectResp.ExitCode == 126 || inspectResp.ExitCode == 127 {
+				return fmt.Errorf("executable file not found (exit code %d)", inspectResp.ExitCode)
+			}
+		}
+	}
+
+	// Bidirectional stream copying
+	done := make(chan struct{})
+
+	// Stream stdout/stderr from container PTY to WebSocket
+	go func() {
+		_, _ = io.Copy(out, br)
+		close(done)
+	}()
+
+	// Stream stdin from WebSocket to container PTY
+	go func() {
+		_, _ = io.Copy(conn, in)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
 }
 
 func (d *SocketDriver) ListNetworks(ctx context.Context) ([]NetworkInfo, error) {
@@ -821,39 +1149,83 @@ func (d *SocketDriver) ExecuteCompose(ctx context.Context, stackPath string, act
 				composeSubCmd = "restart"
 			}
 
-			cmdScript := fmt.Sprintf("sleep 2 && docker compose -f %s --project-directory %s %s",
-				composeFile,
-				hostPath,
-				composeSubCmd,
-			)
+			helperImage := "ghcr.io/farmers00/dockerpulse:latest"
+			var detail struct {
+				Config struct {
+					Image string `json:"Image"`
+				} `json:"Config"`
+			}
+			if err := d.client.Get(ctx, "/containers/"+selfRef+"/json", &detail); err == nil && detail.Config.Image != "" {
+				helperImage = detail.Config.Image
+			}
+
+			userEnv := parseEnvFile(envFile)
+
+			var helperCmdParts []string
+			helperCmdParts = append(helperCmdParts, "docker", "compose", "-f", fmt.Sprintf("%q", filepath.ToSlash(composeFile)))
+			if fileExists(envFile) {
+				helperCmdParts = append(helperCmdParts, "--env-file", fmt.Sprintf("%q", filepath.ToSlash(envFile)))
+			}
+			if hostPath != "" {
+				helperCmdParts = append(helperCmdParts, "--project-directory", fmt.Sprintf("%q", filepath.ToSlash(hostPath)))
+			}
+			helperCmdParts = append(helperCmdParts, composeSubCmd)
+
+			composeExec := strings.Join(helperCmdParts, " ")
+
+			var scriptParts []string
+			scriptParts = append(scriptParts, "unset PORT DATA_DIR JWT_SECRET AGENT_SECRET HOST_BASE_DIR CONTAINER_BASE_DIR PROXY_AUTH_HEADER PROXY_EMAIL_HEADER UPDATE_INTERVAL_MINUTES")
+			for k, v := range userEnv {
+				scriptParts = append(scriptParts, fmt.Sprintf("export %s=%s", k, shellQuote(v)))
+			}
+			scriptParts = append(scriptParts, "sleep 2")
+			scriptParts = append(scriptParts, composeExec)
+
+			cmdScript := strings.Join(scriptParts, " && ")
+			fmt.Fprintf(writer, "[DockPulse] Helper command: %s\n", composeExec)
+			if len(userEnv) > 0 {
+				var exportedKeys []string
+				for k := range userEnv {
+					exportedKeys = append(exportedKeys, k)
+				}
+				fmt.Fprintf(writer, "[DockPulse] Exported environment from .env: %s\n", strings.Join(exportedKeys, ", "))
+			}
+
 			// Ensure any previous helper container with this name is removed first
 			_ = exec.Command("docker", "rm", "-f", "dockerpulse-updater-helper").Run()
 
-			runnerCmd := exec.Command("docker", "run", "--rm", "-d",
+			runArgs := []string{
+				"run", "--rm", "-d",
 				"--name", "dockerpulse-updater-helper",
 				"--label", "com.dockerpulse.helper=true",
 				"--entrypoint", "sh",
 				"-v", "/var/run/docker.sock:/var/run/docker.sock",
 				"--volumes-from", selfRef,
 				"-w", containerPath,
-				"ghcr.io/farmers00/dockerpulse:latest",
-				"-c", cmdScript,
-			)
+			}
+			if _, hasPort := userEnv["PORT"]; !hasPort {
+				runArgs = append(runArgs, "-e", "PORT=")
+			}
+			for k, v := range userEnv {
+				runArgs = append(runArgs, "-e", fmt.Sprintf("%s=%s", k, v))
+			}
+			runArgs = append(runArgs, helperImage, "-c", cmdScript)
+
+			runnerCmd := exec.Command("docker", runArgs...)
 
 			out, err := runnerCmd.CombinedOutput()
 			if err != nil {
 				_ = exec.Command("docker", "rm", "-f", "dockerpulse-updater-helper").Run()
 				if selfRef != "dockerpulse-agent" {
-					runnerCmd2 := exec.Command("docker", "run", "--rm", "-d",
-						"--name", "dockerpulse-updater-helper",
-						"--label", "com.dockerpulse.helper=true",
-						"--entrypoint", "sh",
-						"-v", "/var/run/docker.sock:/var/run/docker.sock",
-						"--volumes-from", "dockerpulse-agent",
-						"-w", containerPath,
-						"ghcr.io/farmers00/dockerpulse:latest",
-						"-c", cmdScript,
-					)
+					runArgs2 := make([]string, len(runArgs))
+					copy(runArgs2, runArgs)
+					for i, arg := range runArgs2 {
+						if arg == "--volumes-from" && i+1 < len(runArgs2) {
+							runArgs2[i+1] = "dockerpulse-agent"
+							break
+						}
+					}
+					runnerCmd2 := exec.Command("docker", runArgs2...)
 					if out2, err2 := runnerCmd2.CombinedOutput(); err2 == nil {
 						out = out2
 						err = nil
@@ -904,9 +1276,93 @@ func (d *SocketDriver) ExecuteCompose(ctx context.Context, stackPath string, act
 	}
 }
 
+var dockerPulseInternalVars = map[string]bool{
+	"PORT":                    true,
+	"DATA_DIR":                true,
+	"JWT_SECRET":              true,
+	"AGENT_SECRET":            true,
+	"HOST_BASE_DIR":           true,
+	"CONTAINER_BASE_DIR":      true,
+	"PROXY_AUTH_HEADER":       true,
+	"PROXY_EMAIL_HEADER":      true,
+	"UPDATE_INTERVAL_MINUTES": true,
+}
+
+func parseEnvFile(p string) map[string]string {
+	res := make(map[string]string)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return res
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+		idx := strings.Index(line, "=")
+		if idx == -1 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+
+		if (strings.HasPrefix(val, "\"") && strings.HasSuffix(val, "\"") && len(val) >= 2) ||
+			(strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'") && len(val) >= 2) {
+			val = val[1 : len(val)-1]
+		} else {
+			if commentIdx := strings.Index(val, " #"); commentIdx != -1 {
+				val = strings.TrimSpace(val[:commentIdx])
+			}
+		}
+
+		if key != "" {
+			res[key] = val
+		}
+	}
+	return res
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func buildComposeEnv(workingDir string) []string {
+	envFile := filepath.Join(workingDir, ".env")
+	userEnv := parseEnvFile(envFile)
+
+	var result []string
+	for _, env := range os.Environ() {
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) == 2 {
+			k := parts[0]
+			if dockerPulseInternalVars[k] {
+				if _, ok := userEnv[k]; !ok {
+					continue
+				}
+			}
+			if _, ok := userEnv[k]; ok {
+				continue
+			}
+			result = append(result, env)
+		}
+	}
+
+	for k, v := range userEnv {
+		result = append(result, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	return result
+}
+
 func (d *SocketDriver) runComposeCmd(ctx context.Context, workingDir string, args []string, writer io.Writer) error {
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = workingDir
+	cmd.Env = buildComposeEnv(workingDir)
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 

@@ -13,7 +13,6 @@ services:
       # Mount your host's docker compose directory (e.g. ~/docker)
       - ${HOME}/docker:/root/docker
     environment:
-      - PORT=8080
       - DATA_DIR=/data
       - HOST_BASE_DIR=${HOST_BASE_DIR:-${HOME}/docker}
       - JWT_SECRET=${JWT_SECRET:-change_me_to_a_secure_random_string_in_production}

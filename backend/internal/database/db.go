@@ -109,11 +109,58 @@ func (db *DB) migrate() error {
 		details TEXT,
 		created_at DATETIME NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS notifications (
+		id TEXT PRIMARY KEY,
+		title TEXT NOT NULL,
+		message TEXT NOT NULL,
+		type TEXT NOT NULL DEFAULT 'info',
+		host_id TEXT,
+		read BOOLEAN NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS notification_configs (
+		id TEXT PRIMARY KEY,
+		enabled BOOLEAN NOT NULL DEFAULT 0,
+		config_json TEXT NOT NULL DEFAULT '{}',
+		status TEXT NOT NULL DEFAULT 'unconfigured',
+		last_error TEXT NOT NULL DEFAULT '',
+		updated_at DATETIME NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS scheduler_config (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		enabled BOOLEAN NOT NULL DEFAULT 1,
+		interval_minutes INTEGER NOT NULL DEFAULT 360,
+		last_run DATETIME,
+		next_run DATETIME
+	);
 	`
 	_, err := db.conn.Exec(schema)
 	if err != nil {
 		return err
 	}
+
+	// Schema migrations for users table
+	_, _ = db.conn.Exec("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+	_, _ = db.conn.Exec("ALTER TABLE users ADD COLUMN avatar TEXT NOT NULL DEFAULT ''")
+	_, _ = db.conn.Exec("ALTER TABLE users ADD COLUMN theme TEXT NOT NULL DEFAULT 'dark'")
+
+	// Seed notification configs if missing
+	_, _ = db.conn.Exec(`
+		INSERT OR IGNORE INTO notification_configs (id, enabled, config_json, status, last_error, updated_at)
+		VALUES
+			('ntfy', 0, '{}', 'unconfigured', '', CURRENT_TIMESTAMP),
+			('discord', 0, '{}', 'unconfigured', '', CURRENT_TIMESTAMP),
+			('signal', 0, '{}', 'unconfigured', '', CURRENT_TIMESTAMP);
+	`)
+
+	// Seed scheduler config if missing
+	_, _ = db.conn.Exec(`
+		INSERT OR IGNORE INTO scheduler_config (id, enabled, interval_minutes, last_run, next_run)
+		VALUES (1, 1, 360, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+	`)
 
 	// Deduplicate any duplicate stacks on the same host (e.g. from previous container vs host path scans)
 	// Prefer host path (not starting with /root/docker/ when alternative exists) or newer updated_at
@@ -145,24 +192,125 @@ func (db *DB) CreateUser(u *User) error {
 	if u.ID == "" {
 		u.ID = uuid.NewString()
 	}
+	if u.DisplayName == "" {
+		u.DisplayName = u.Username
+	}
+	if u.Theme == "" {
+		u.Theme = "dark"
+	}
 	u.CreatedAt = time.Now().UTC()
 	_, err := db.conn.Exec(
-		"INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
-		u.ID, u.Username, u.PasswordHash, u.Role, u.CreatedAt,
+		"INSERT INTO users (id, username, password_hash, role, display_name, avatar, theme, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		u.ID, u.Username, u.PasswordHash, u.Role, u.DisplayName, u.Avatar, u.Theme, u.CreatedAt,
 	)
 	return err
 }
 
 func (db *DB) GetUserByUsername(username string) (*User, error) {
 	u := &User{}
+	var displayName, avatar, theme sql.NullString
 	err := db.conn.QueryRow(
-		"SELECT id, username, password_hash, role, created_at FROM users WHERE username = ?",
+		"SELECT id, username, password_hash, role, display_name, avatar, theme, created_at FROM users WHERE username = ?",
 		username,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.CreatedAt)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &displayName, &avatar, &theme, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
+	if displayName.Valid && displayName.String != "" {
+		u.DisplayName = displayName.String
+	} else {
+		u.DisplayName = u.Username
+	}
+	if avatar.Valid {
+		u.Avatar = avatar.String
+	}
+	if theme.Valid && theme.String != "" {
+		u.Theme = theme.String
+	} else {
+		u.Theme = "dark"
+	}
 	return u, nil
+}
+
+func (db *DB) GetUserByID(id string) (*User, error) {
+	u := &User{}
+	var displayName, avatar, theme sql.NullString
+	err := db.conn.QueryRow(
+		"SELECT id, username, password_hash, role, display_name, avatar, theme, created_at FROM users WHERE id = ?",
+		id,
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &displayName, &avatar, &theme, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if displayName.Valid && displayName.String != "" {
+		u.DisplayName = displayName.String
+	} else {
+		u.DisplayName = u.Username
+	}
+	if avatar.Valid {
+		u.Avatar = avatar.String
+	}
+	if theme.Valid && theme.String != "" {
+		u.Theme = theme.String
+	} else {
+		u.Theme = "dark"
+	}
+	return u, nil
+}
+
+func (db *DB) ListUsers() ([]User, error) {
+	rows, err := db.conn.Query("SELECT id, username, password_hash, role, display_name, avatar, theme, created_at FROM users ORDER BY created_at ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var u User
+		var displayName, avatar, theme sql.NullString
+		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &displayName, &avatar, &theme, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		if displayName.Valid && displayName.String != "" {
+			u.DisplayName = displayName.String
+		} else {
+			u.DisplayName = u.Username
+		}
+		if avatar.Valid {
+			u.Avatar = avatar.String
+		}
+		if theme.Valid && theme.String != "" {
+			u.Theme = theme.String
+		} else {
+			u.Theme = "dark"
+		}
+		users = append(users, u)
+	}
+	return users, nil
+}
+
+func (db *DB) UpdateUserProfile(id string, displayName, username, avatar, theme string) error {
+	_, err := db.conn.Exec(
+		"UPDATE users SET display_name = ?, username = ?, avatar = ?, theme = ? WHERE id = ?",
+		displayName, username, avatar, theme, id,
+	)
+	return err
+}
+
+func (db *DB) UpdateUserPassword(id string, passwordHash string) error {
+	_, err := db.conn.Exec("UPDATE users SET password_hash = ? WHERE id = ?", passwordHash, id)
+	return err
+}
+
+func (db *DB) UpdateUserRole(id string, role UserRole) error {
+	_, err := db.conn.Exec("UPDATE users SET role = ? WHERE id = ?", role, id)
+	return err
+}
+
+func (db *DB) DeleteUser(id string) error {
+	_, err := db.conn.Exec("DELETE FROM users WHERE id = ?", id)
+	return err
 }
 
 // Host operations
@@ -394,4 +542,154 @@ func (db *DB) ListRevisions(stackID string) ([]StackRevision, error) {
 		revs = append(revs, r)
 	}
 	return revs, nil
+}
+
+// Notification operations
+func (db *DB) CreateNotification(n *Notification) error {
+	if n.ID == "" {
+		n.ID = uuid.NewString()
+	}
+	if n.CreatedAt.IsZero() {
+		n.CreatedAt = time.Now().UTC()
+	}
+	_, err := db.conn.Exec(`
+		INSERT INTO notifications (id, title, message, type, host_id, read, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, n.ID, n.Title, n.Message, n.Type, n.HostID, n.Read, n.CreatedAt)
+	return err
+}
+
+func (db *DB) ListNotifications(limit int) ([]Notification, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := db.conn.Query(`
+		SELECT id, title, message, type, COALESCE(host_id, ''), read, created_at
+		FROM notifications
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	notifs := make([]Notification, 0)
+	for rows.Next() {
+		var n Notification
+		if err := rows.Scan(&n.ID, &n.Title, &n.Message, &n.Type, &n.HostID, &n.Read, &n.CreatedAt); err != nil {
+			return nil, err
+		}
+		notifs = append(notifs, n)
+	}
+	return notifs, nil
+}
+
+func (db *DB) GetUnreadNotificationCount() (int, error) {
+	var count int
+	err := db.conn.QueryRow("SELECT COUNT(*) FROM notifications WHERE read = 0").Scan(&count)
+	return count, err
+}
+
+func (db *DB) MarkNotificationRead(id string) error {
+	_, err := db.conn.Exec("UPDATE notifications SET read = 1 WHERE id = ?", id)
+	return err
+}
+
+func (db *DB) MarkAllNotificationsRead() error {
+	_, err := db.conn.Exec("UPDATE notifications SET read = 1")
+	return err
+}
+
+func (db *DB) DeleteNotification(id string) error {
+	_, err := db.conn.Exec("DELETE FROM notifications WHERE id = ?", id)
+	return err
+}
+
+func (db *DB) ClearAllNotifications() error {
+	_, err := db.conn.Exec("DELETE FROM notifications")
+	return err
+}
+
+// NotificationConfig operations
+func (db *DB) GetNotificationConfigs() ([]NotificationConfig, error) {
+	rows, err := db.conn.Query("SELECT id, enabled, config_json, status, last_error, updated_at FROM notification_configs ORDER BY id ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	configs := make([]NotificationConfig, 0)
+	for rows.Next() {
+		var c NotificationConfig
+		if err := rows.Scan(&c.ID, &c.Enabled, &c.ConfigJSON, &c.Status, &c.LastError, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		configs = append(configs, c)
+	}
+	return configs, nil
+}
+
+func (db *DB) GetNotificationConfig(id string) (*NotificationConfig, error) {
+	c := &NotificationConfig{}
+	err := db.conn.QueryRow(
+		"SELECT id, enabled, config_json, status, last_error, updated_at FROM notification_configs WHERE id = ?",
+		id,
+	).Scan(&c.ID, &c.Enabled, &c.ConfigJSON, &c.Status, &c.LastError, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (db *DB) SaveNotificationConfig(cfg *NotificationConfig) error {
+	cfg.UpdatedAt = time.Now().UTC()
+	_, err := db.conn.Exec(`
+		INSERT INTO notification_configs (id, enabled, config_json, status, last_error, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			enabled = excluded.enabled,
+			config_json = excluded.config_json,
+			status = excluded.status,
+			last_error = excluded.last_error,
+			updated_at = excluded.updated_at
+	`, cfg.ID, cfg.Enabled, cfg.ConfigJSON, cfg.Status, cfg.LastError, cfg.UpdatedAt)
+	return err
+}
+
+// SchedulerConfig operations
+func (db *DB) GetSchedulerConfig() (*SchedulerConfig, error) {
+	c := &SchedulerConfig{}
+	var lastRun, nextRun sql.NullTime
+	err := db.conn.QueryRow("SELECT enabled, interval_minutes, last_run, next_run FROM scheduler_config WHERE id = 1").
+		Scan(&c.Enabled, &c.IntervalMinutes, &lastRun, &nextRun)
+	if err != nil {
+		// Fallback default
+		return &SchedulerConfig{
+			Enabled:         true,
+			IntervalMinutes: 360,
+			LastRun:         time.Now().UTC(),
+			NextRun:         time.Now().UTC().Add(6 * time.Hour),
+		}, nil
+	}
+	if lastRun.Valid {
+		c.LastRun = lastRun.Time
+	}
+	if nextRun.Valid {
+		c.NextRun = nextRun.Time
+	}
+	return c, nil
+}
+
+func (db *DB) SaveSchedulerConfig(cfg *SchedulerConfig) error {
+	_, err := db.conn.Exec(`
+		INSERT INTO scheduler_config (id, enabled, interval_minutes, last_run, next_run)
+		VALUES (1, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			enabled = excluded.enabled,
+			interval_minutes = excluded.interval_minutes,
+			last_run = excluded.last_run,
+			next_run = excluded.next_run
+	`, cfg.Enabled, cfg.IntervalMinutes, cfg.LastRun, cfg.NextRun)
+	return err
 }

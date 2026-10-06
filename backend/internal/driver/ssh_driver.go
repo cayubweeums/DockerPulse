@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -165,7 +167,118 @@ func (s *SSHDriver) ListContainers(ctx context.Context) ([]ContainerInfo, error)
 		result = append(result, info)
 	}
 
+	// Fetch live resource usage for running containers via docker stats
+	hasRunning := false
+	for _, r := range result {
+		if r.State == "running" {
+			hasRunning = true
+			break
+		}
+	}
+
+	if hasRunning {
+		statsOut, err := s.runCommand(`docker stats --no-stream --format '{{json .}}'`)
+		if err == nil && strings.TrimSpace(statsOut) != "" {
+			type rawStat struct {
+				ID       string `json:"ID"`
+				Name     string `json:"Name"`
+				CPUPerc  string `json:"CPUPerc"`
+				MemUsage string `json:"MemUsage"`
+				MemPerc  string `json:"MemPerc"`
+				NetIO    string `json:"NetIO"`
+			}
+			statsMap := make(map[string]rawStat)
+			for _, sline := range strings.Split(strings.TrimSpace(statsOut), "\n") {
+				var st rawStat
+				if err := json.Unmarshal([]byte(sline), &st); err == nil {
+					if st.ID != "" {
+						statsMap[st.ID] = st
+					}
+					if st.Name != "" {
+						statsMap[st.Name] = st
+					}
+				}
+			}
+
+			for i := range result {
+				if result[i].State != "running" {
+					continue
+				}
+				var matched *rawStat
+				if st, ok := statsMap[result[i].ID]; ok {
+					matched = &st
+				} else if len(result[i].ID) >= 12 {
+					if st, ok := statsMap[result[i].ID[:12]]; ok {
+						matched = &st
+					}
+				}
+				if matched == nil && len(result[i].Names) > 0 {
+					cleanName := strings.TrimPrefix(result[i].Names[0], "/")
+					if st, ok := statsMap[cleanName]; ok {
+						matched = &st
+					}
+				}
+
+				if matched != nil {
+					// CPU %
+					cpuStr := strings.TrimSuffix(strings.TrimSpace(matched.CPUPerc), "%")
+					if cpu, err := strconv.ParseFloat(cpuStr, 64); err == nil {
+						result[i].CPUPct = math.Round(cpu*10) / 10
+					}
+
+					// Mem %
+					memPercStr := strings.TrimSuffix(strings.TrimSpace(matched.MemPerc), "%")
+					if mp, err := strconv.ParseFloat(memPercStr, 64); err == nil {
+						result[i].MemoryPct = math.Round(mp*10) / 10
+					}
+
+					// Mem Usage: "667MiB / 31.25GiB"
+					if parts := strings.Split(matched.MemUsage, "/"); len(parts) >= 1 {
+						result[i].MemoryMB = parseHumanMB(parts[0])
+					}
+
+					// Net I/O: "15.4MB / 120.3MB"
+					if parts := strings.Split(matched.NetIO, "/"); len(parts) >= 2 {
+						result[i].NetInputMB = parseHumanMB(parts[0])
+						result[i].NetOutputMB = parseHumanMB(parts[1])
+					}
+				}
+			}
+		}
+	}
+
 	return result, nil
+}
+
+func parseHumanMB(val string) float64 {
+	val = strings.TrimSpace(val)
+	if val == "" || val == "--" || val == "0B" {
+		return 0
+	}
+	idx := 0
+	for idx < len(val) && ((val[idx] >= '0' && val[idx] <= '9') || val[idx] == '.') {
+		idx++
+	}
+	if idx == 0 {
+		return 0
+	}
+	num, err := strconv.ParseFloat(val[:idx], 64)
+	if err != nil {
+		return 0
+	}
+	unit := strings.TrimSpace(strings.ToLower(val[idx:]))
+	switch unit {
+	case "gib", "gb":
+		return math.Round(num*1024*10) / 10
+	case "mib", "mb":
+		return math.Round(num*10) / 10
+	case "kib", "kb":
+		return math.Round((num/1024)*10) / 10
+	case "b":
+		return math.Round((num/(1024*1024))*10) / 10
+	default:
+		return math.Round(num*10) / 10
+	}
 }
 
 func (s *SSHDriver) StartContainer(ctx context.Context, id string) error {

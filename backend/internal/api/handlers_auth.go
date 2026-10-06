@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/dockpulse/dockmgr/internal/auth"
@@ -134,9 +135,26 @@ func (s *Server) handleMe(c *gin.Context) {
 	role, _ := c.Get("role")
 	userID, _ := c.Get("user_id")
 
+	displayName := ""
+	avatar := ""
+	theme := "dark"
+	if u, err := s.db.GetUserByID(fmt.Sprint(userID)); err == nil && u != nil {
+		displayName = u.DisplayName
+		avatar = u.Avatar
+		if u.Theme != "" {
+			theme = u.Theme
+		}
+	}
+	if displayName == "" && username != nil {
+		displayName = fmt.Sprint(username)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"user_id":  userID,
-		"username": username,
-		"role":     role,
+		"user_id":      userID,
+		"username":     username,
+		"display_name": displayName,
+		"avatar":       avatar,
+		"theme":        theme,
+		"role":         role,
 	})
 }

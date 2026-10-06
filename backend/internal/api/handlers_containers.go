@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/dockpulse/dockmgr/internal/driver"
@@ -192,15 +193,19 @@ func (s *Server) handleContainerTerminalWS(c *gin.Context) {
 		}
 	}()
 
-	cmd := []string{"/bin/sh"}
+	shell := c.DefaultQuery("shell", "/bin/sh")
+	cmd := []string{shell}
 	_ = d.ExecShell(ctx, cid, cmd, inReader, outWriter, resizeChan)
 }
 
 type wsWriter struct {
+	mu sync.Mutex
 	ws *websocket.Conn
 }
 
 func (w *wsWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	err = w.ws.WriteMessage(websocket.BinaryMessage, p)
 	return len(p), err
 }

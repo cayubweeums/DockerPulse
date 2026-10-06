@@ -21,20 +21,24 @@ import {
   CheckCircle2,
   AlertCircle,
   Cpu,
-  Settings
+  Settings,
+  MoreVertical,
+  Bell
 } from 'lucide-react';
 import { api } from './api/client';
-import { Host, ContainerInfo, Stack, SystemInfo, User } from './types';
+import { Host, ContainerInfo, Stack, SystemInfo, User, InAppNotification } from './types';
 import { LiveLogsModal } from './components/LiveLogsModal';
 import { TerminalModal } from './components/TerminalModal';
 import { ComposeEditorModal } from './components/ComposeEditorModal';
 import { UpdateModal } from './components/UpdateModal';
 import { NetworksModal } from './components/NetworksModal';
 import { StorageModal } from './components/StorageModal';
-import { AddHostModal } from './components/AddHostModal';
-import { DeployAgentModal } from './components/DeployAgentModal';
+import { AddClientModal } from './components/AddClientModal';
 import { HostSettingsModal } from './components/HostSettingsModal';
 import { AuthModal } from './components/AuthModal';
+import { NotificationsDrawer } from './components/NotificationsDrawer';
+import { SettingsView } from './components/Settings/SettingsView';
+import { APP_VERSION } from './version';
 
 function matchesStack(c: ContainerInfo, s: Stack): boolean {
   if (!c || !s) return false;
@@ -109,15 +113,27 @@ export const App: React.FC = () => {
 
   const [hosts, setHosts] = useState<Host[]>([]);
   const [selectedHostId, setSelectedHostId] = useState<string>('');
-  const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
-  const [containers, setContainers] = useState<ContainerInfo[]>([]);
-  const [stacks, setStacks] = useState<Stack[]>([]);
-  const [updates, setUpdates] = useState<Record<string, boolean>>({});
+  const [containersByHost, setContainersByHost] = useState<Record<string, ContainerInfo[]>>({});
+  const [stacksByHost, setStacksByHost] = useState<Record<string, Stack[]>>({});
+  const [systemByHost, setSystemByHost] = useState<Record<string, SystemInfo | null>>({});
+
+  const containers = useMemo(() => containersByHost[selectedHostId] || [], [containersByHost, selectedHostId]);
+  const stacks = useMemo(() => stacksByHost[selectedHostId] || [], [stacksByHost, selectedHostId]);
+  const systemInfo = useMemo(() => systemByHost[selectedHostId] || null, [systemByHost, selectedHostId]);
+
+  const [updatesByHost, setUpdatesByHost] = useState<Record<string, Record<string, boolean>>>({});
+  const updates = useMemo(() => updatesByHost[selectedHostId] || {}, [updatesByHost, selectedHostId]);
 
   const [viewMode, setViewMode] = useState<'containers' | 'stacks'>('containers');
+  const [currentView, setCurrentView] = useState<'dashboard' | 'settings'>('dashboard');
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+
+  // In-App Notifications
+  const [notifications, setNotifications] = useState<InAppNotification[]>([]);
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+  const [showNotificationsDrawer, setShowNotificationsDrawer] = useState(false);
 
   // Active Modals
   const [logContainer, setLogContainer] = useState<ContainerInfo | null>(null);
@@ -126,15 +142,78 @@ export const App: React.FC = () => {
   const [updateAction, setUpdateAction] = useState<{ stack?: Stack; stacks?: Stack[]; action: string } | null>(null);
   const [showNetworks, setShowNetworks] = useState(false);
   const [showStorage, setShowStorage] = useState(false);
-  const [showAddHost, setShowAddHost] = useState(false);
-  const [showDeployAgent, setShowDeployAgent] = useState(false);
+  const [showAddClient, setShowAddClient] = useState(false);
   const [showHostSettings, setShowHostSettings] = useState(false);
   const [fleetStats, setFleetStats] = useState<Record<string, { running: number; total: number; updates: number }>>({});
+  const [openActionMenuId, setOpenActionMenuId] = useState<string | null>(null);
+
+  const loadNotifications = async () => {
+    try {
+      const [list, unreadRes] = await Promise.all([
+        api.listNotifications(100),
+        api.getUnreadNotificationCount(),
+      ]);
+      setNotifications(list);
+      setUnreadCount(unreadRes.unread_count);
+    } catch (err) {
+      console.error('Failed to load notifications:', err);
+    }
+  };
+
+  const handleDismissNotification = async (id: string) => {
+    try {
+      await api.dismissNotification(id);
+      setNotifications((prev) => prev.filter((n) => n.id !== id));
+      setUnreadCount((prev) => Math.max(0, prev - 1));
+    } catch (err) {
+      console.error('Failed to dismiss notification:', err);
+    }
+  };
+
+  const handleDismissAllNotifications = async () => {
+    try {
+      await api.clearAllNotifications();
+      setNotifications([]);
+      setUnreadCount(0);
+    } catch (err) {
+      console.error('Failed to dismiss all notifications:', err);
+    }
+  };
+
+  const handleMarkAllRead = async () => {
+    try {
+      await api.markAllNotificationsRead();
+      setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+      setUnreadCount(0);
+    } catch (err) {
+      console.error('Failed to mark all read:', err);
+    }
+  };
+
+  // Close container action dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement)?.closest('[data-dropdown="container-actions"]')) {
+        setOpenActionMenuId(null);
+      }
+    };
+    window.addEventListener('click', handleClickOutside);
+    return () => window.removeEventListener('click', handleClickOutside);
+  }, []);
 
   // Check auth status on boot
   useEffect(() => {
     checkAuth();
   }, []);
+
+  // Poll notifications when logged in
+  useEffect(() => {
+    if (user) {
+      loadNotifications();
+      const interval = setInterval(loadNotifications, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [user]);
 
   const checkAuth = async () => {
     try {
@@ -183,35 +262,94 @@ export const App: React.FC = () => {
     }
   };
 
-  // Load host data when selectedHostId changes
+  // Load host data and check updates whenever navigating to a server page
   useEffect(() => {
     if (selectedHostId) {
-      setUpdates({});
       refreshHostData();
+      handleCheckUpdates(true, selectedHostId);
     }
   }, [selectedHostId]);
 
-  const refreshHostData = async () => {
+  // Periodic container live stats refresh every 5 seconds (zero overhead when tab hidden)
+  useEffect(() => {
     if (!selectedHostId) return;
-    setLoading(true);
+
+    const interval = setInterval(() => {
+      // Skip if browser tab is hidden, background directory scan in progress, or modal update executing
+      if (document.hidden || scanning || updateAction) return;
+
+      api.listContainers(selectedHostId)
+        .then((fresh) => {
+          if (Array.isArray(fresh)) {
+            setContainersByHost((prev) => {
+              const currentForHost = prev[selectedHostId] || [];
+              const prevMap = new Map(currentForHost.map((c) => [c.id, c]));
+              const merged = fresh.map((c) => {
+                const old = prevMap.get(c.id);
+                if (old && c.state === 'running' && c.memory_mb === 0 && old.memory_mb > 0) {
+                  return {
+                    ...c,
+                    cpu_pct: c.cpu_pct > 0 ? c.cpu_pct : old.cpu_pct,
+                    memory_mb: old.memory_mb,
+                    memory_pct: old.memory_pct,
+                    net_input_mb: c.net_input_mb > 0 ? c.net_input_mb : old.net_input_mb,
+                    net_output_mb: c.net_output_mb > 0 ? c.net_output_mb : old.net_output_mb,
+                  };
+                }
+                return c;
+              });
+              return {
+                ...prev,
+                [selectedHostId]: merged,
+              };
+            });
+          }
+        })
+        .catch(() => {});
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [selectedHostId, scanning, updateAction]);
+
+  const refreshHostData = async (targetHostId?: string) => {
+    const hostId = targetHostId || selectedHostId;
+    if (!hostId) return;
+
+    // If no cached data exists yet for this host, indicate loading
+    setContainersByHost((curr) => {
+      if (!curr[hostId] || curr[hostId].length === 0) {
+        setLoading(true);
+      }
+      return curr;
+    });
+
     try {
       const [cList, sList, sys] = await Promise.all([
-        api.listContainers(selectedHostId).catch((err) => {
+        api.listContainers(hostId).catch((err) => {
           console.error('Failed to list containers:', err);
           return [];
         }),
-        api.listStacks(selectedHostId).catch((err) => {
+        api.listStacks(hostId).catch((err) => {
           console.error('Failed to list stacks:', err);
           return [];
         }),
-        api.getHostSystem(selectedHostId).catch((err) => {
+        api.getHostSystem(hostId).catch((err) => {
           console.error('Failed to get host system:', err);
           return null;
         }),
       ]);
-      setContainers(Array.isArray(cList) ? cList : []);
-      setStacks(Array.isArray(sList) ? sList : []);
-      setSystemInfo(sys);
+      setContainersByHost((prev) => ({
+        ...prev,
+        [hostId]: Array.isArray(cList) ? cList : [],
+      }));
+      setStacksByHost((prev) => ({
+        ...prev,
+        [hostId]: Array.isArray(sList) ? sList : [],
+      }));
+      setSystemByHost((prev) => ({
+        ...prev,
+        [hostId]: sys,
+      }));
     } finally {
       setLoading(false);
     }
@@ -222,7 +360,10 @@ export const App: React.FC = () => {
     try {
       setScanning(true);
       const discovered = await api.discoverStacks(selectedHostId);
-      setStacks(Array.isArray(discovered) ? discovered : []);
+      setStacksByHost((prev) => ({
+        ...prev,
+        [selectedHostId]: Array.isArray(discovered) ? discovered : [],
+      }));
       loadHosts();
     } catch (err: any) {
       alert(err.message || 'Discovery failed');
@@ -243,11 +384,12 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleCheckUpdates = async (silent = false) => {
-    if (!selectedHostId) return;
+  const handleCheckUpdates = async (silent = false, targetHostId?: string) => {
+    const hostId = targetHostId || selectedHostId;
+    if (!hostId) return;
     try {
       setCheckingUpdates(true);
-      const results = await api.checkUpdates(selectedHostId);
+      const results = await api.checkUpdates(hostId);
       const map: Record<string, boolean> = {};
       (Array.isArray(results) ? results : []).forEach((r) => {
         if (r.has_update) {
@@ -270,34 +412,45 @@ export const App: React.FC = () => {
           }
         }
       });
-      setUpdates(map);
+      setUpdatesByHost((prev) => ({
+        ...prev,
+        [hostId]: map,
+      }));
     } catch (err: any) {
       if (!silent) {
         alert(err.message || 'Update check failed');
       } else {
-        console.warn('Daily update check failed:', err);
+        console.warn('Update check failed:', err);
       }
     } finally {
       setCheckingUpdates(false);
+      loadNotifications();
     }
   };
 
-  // Sync fleetStats for current selected host
+  // Synchronize fleetStats atomically per host to prevent cross-host update count flapping
   useEffect(() => {
-    if (!selectedHostId) return;
-    const running = containerList.filter((c) => c && c.state === 'running').length;
-    const updateCount = containerList.filter((c) => isContainerUpdateAvailable(c, updates)).length;
-    setFleetStats((prev) => ({
-      ...prev,
-      [selectedHostId]: {
-        running,
-        total: containerList.length,
-        updates: updateCount,
-      },
-    }));
-  }, [selectedHostId, containers, updates]);
+    if (hosts.length === 0) return;
+    setFleetStats((prev) => {
+      const next = { ...prev };
+      hosts.forEach((h) => {
+        const hContainers = containersByHost[h.id];
+        if (hContainers) {
+          const running = hContainers.filter((c) => c && c.state === 'running').length;
+          const hUpdates = updatesByHost[h.id] || {};
+          const updateCount = hContainers.filter((c) => isContainerUpdateAvailable(c, hUpdates)).length;
+          next[h.id] = {
+            running,
+            total: hContainers.length,
+            updates: updateCount,
+          };
+        }
+      });
+      return next;
+    });
+  }, [hosts, containersByHost, updatesByHost]);
 
-  // Background fetch container counts for other fleet hosts
+  // Background warm containers cache for other fleet hosts so switching servers is instant
   useEffect(() => {
     if (hosts.length === 0) return;
     hosts.forEach(async (h) => {
@@ -305,16 +458,13 @@ export const App: React.FC = () => {
       try {
         const list = await api.listContainers(h.id);
         if (Array.isArray(list)) {
-          const rCount = list.filter((c) => c && c.state === 'running').length;
-          const uCount = list.filter((c) => c && c.has_update).length;
-          setFleetStats((prev) => ({
-            ...prev,
-            [h.id]: {
-              running: rCount,
-              total: list.length,
-              updates: uCount > 0 ? uCount : prev[h.id]?.updates || 0,
-            },
-          }));
+          setContainersByHost((prev) => {
+            if (prev[h.id] && prev[h.id].length > 0) return prev;
+            return {
+              ...prev,
+              [h.id]: list,
+            };
+          });
         }
       } catch {
         // host offline
@@ -322,27 +472,15 @@ export const App: React.FC = () => {
     });
   }, [hosts]);
 
-  // Daily auto-update check per host on first visit each day
-  useEffect(() => {
-    if (!selectedHostId || loading) return;
-
-    const today = new Date().toISOString().slice(0, 10);
-    const key = `dockerpulse_daily_update_${selectedHostId}`;
-    const lastChecked = localStorage.getItem(key);
-
-    if (lastChecked !== today) {
-      localStorage.setItem(key, today);
-      handleCheckUpdates(true);
-    }
-  }, [selectedHostId, loading]);
-
   const handleContainerOp = async (cid: string, op: 'start' | 'stop' | 'restart' | 'remove') => {
     try {
       if (op === 'start') await api.startContainer(selectedHostId, cid);
       if (op === 'stop') await api.stopContainer(selectedHostId, cid);
       if (op === 'restart') await api.restartContainer(selectedHostId, cid);
       if (op === 'remove') {
-        if (!confirm('Remove container?')) return;
+        const targetContainer = containers.find((c) => c.id === cid);
+        const cName = targetContainer?.names[0]?.replace('/', '') || cid.slice(0, 12);
+        if (!window.confirm(`Are you sure you want to remove container "${cName}"?\n\nThis will permanently delete the container.`)) return;
         await api.removeContainer(selectedHostId, cid, true);
       }
       refreshHostData();
@@ -387,6 +525,26 @@ export const App: React.FC = () => {
           loadHosts();
         }}
       />
+    );
+  }
+
+  if (currentView === 'settings') {
+    return (
+      <>
+        <SettingsView
+          onBackToDashboard={() => setCurrentView('dashboard')}
+          currentUser={user}
+          onUserUpdated={setUser}
+        />
+        <NotificationsDrawer
+          isOpen={showNotificationsDrawer}
+          onClose={() => setShowNotificationsDrawer(false)}
+          notifications={notifications}
+          onDismiss={handleDismissNotification}
+          onDismissAll={handleDismissAllNotifications}
+          onMarkAllRead={handleMarkAllRead}
+        />
+      </>
     );
   }
 
@@ -442,19 +600,11 @@ export const App: React.FC = () => {
             )}
 
             <button
-              onClick={() => setShowAddHost(true)}
-              className="flex items-center gap-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors"
+              onClick={() => setShowAddClient(true)}
+              className="flex items-center gap-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 px-3 py-1.5 text-xs font-semibold text-white shadow-sm shadow-sky-600/20 transition-all"
             >
-              <Plus className="w-3.5 h-3.5 text-sky-400" />
-              Add Server
-            </button>
-
-            <button
-              onClick={() => setShowDeployAgent(true)}
-              className="flex items-center gap-1.5 rounded-lg bg-sky-600/10 hover:bg-sky-600/20 border border-sky-500/30 px-3 py-1.5 text-xs font-medium text-sky-400 transition-colors"
-            >
-              <Cpu className="w-3.5 h-3.5" />
-              Deploy Agent
+              <Plus className="w-3.5 h-3.5" />
+              Add Client
             </button>
           </div>
 
@@ -487,6 +637,30 @@ export const App: React.FC = () => {
               Check Updates
             </button>
 
+            {/* Notifications Drawer Toggle */}
+            <button
+              onClick={() => setShowNotificationsDrawer(true)}
+              title="Notifications"
+              className="relative rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-colors"
+            >
+              <Bell className="w-4 h-4" />
+              {unreadCount > 0 && (
+                <span className="absolute -top-1 -right-1 flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[10px] font-bold font-mono text-white bg-rose-500 rounded-full border-2 border-slate-900 shadow-sm animate-in zoom-in-50">
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </span>
+              )}
+            </button>
+
+            {/* System Settings Gear Icon */}
+            <button
+              onClick={() => setCurrentView('settings')}
+              title="System Settings"
+              className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-sky-400 transition-colors"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+
+            {/* Sign Out Button */}
             <button
               onClick={() => {
                 localStorage.removeItem('dockpulse_token');
@@ -494,7 +668,7 @@ export const App: React.FC = () => {
                 setAuthNeeded(true);
               }}
               title="Sign Out"
-              className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-colors ml-1"
+              className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-colors ml-0.5"
             >
               <LogOut className="w-4 h-4" />
             </button>
@@ -571,10 +745,10 @@ export const App: React.FC = () => {
                 <Server className="w-4 h-4" /> Connect Local Server
               </button>
               <button
-                onClick={() => setShowDeployAgent(true)}
+                onClick={() => setShowAddClient(true)}
                 className="flex items-center gap-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-5 py-2.5 text-xs font-semibold text-slate-200 transition-colors"
               >
-                <Cpu className="w-4 h-4 text-sky-400" /> Deploy Remote Agent
+                <Plus className="w-4 h-4 text-sky-400" /> Add Client
               </button>
             </div>
           </div>
@@ -679,11 +853,14 @@ export const App: React.FC = () => {
             )}
 
             <button
-              onClick={refreshHostData}
-              disabled={loading}
+              onClick={() => {
+                refreshHostData();
+                handleCheckUpdates(true, selectedHostId);
+              }}
+              disabled={loading || checkingUpdates}
               className="flex items-center gap-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-3.5 h-3.5 ${loading || checkingUpdates ? 'animate-spin' : ''}`} />
               Refresh
             </button>
           </div>
@@ -692,7 +869,12 @@ export const App: React.FC = () => {
         {/* Containers List View */}
         {viewMode === 'containers' && (
           <div className="space-y-3">
-            {containerList.length === 0 ? (
+            {loading && containerList.length === 0 ? (
+              <div className="py-16 text-center text-slate-400 font-mono text-sm border border-dashed border-slate-800/80 rounded-xl flex flex-col items-center justify-center gap-3">
+                <RefreshCw className="w-5 h-5 text-sky-400 animate-spin" />
+                <span>Connecting to server and loading containers...</span>
+              </div>
+            ) : containerList.length === 0 ? (
               <div className="py-16 text-center text-slate-500 font-mono text-sm border border-dashed border-slate-800 rounded-xl">
                 No containers detected on this host.
               </div>
@@ -748,7 +930,7 @@ export const App: React.FC = () => {
                           )}
                         </div>
                         <div className="flex items-center gap-2 text-xs text-slate-400 font-mono mt-0.5 min-w-0">
-                          <span className="truncate max-w-[200px] sm:max-w-[260px] md:max-w-[320px]" title={c.image}>
+                          <span className="truncate max-w-xs sm:max-w-md lg:max-w-lg xl:max-w-xl" title={c.image}>
                             {formatImage(c.image)}
                           </span>
                           <span className="shrink-0">&bull;</span>
@@ -757,89 +939,138 @@ export const App: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Middle: Live Stats (CPU / RAM / Net) */}
+                    {/* Middle: Live Stats (CPU / RAM / Net) with fixed column widths for straight vertical alignment */}
                     <div className="flex items-center gap-6 text-xs font-mono text-slate-300 shrink-0">
-                      <div>
+                      <div className="w-28 shrink-0">
                         <span className="text-[10px] text-slate-500 block">CPU</span>
                         <div className="flex items-center gap-1.5">
-                          <span className="font-semibold">{(c.cpu_pct || 0).toFixed(1)}%</span>
-                          <div className="w-16 bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                          <span className="font-semibold w-11 text-left">{(c.cpu_pct || 0).toFixed(1)}%</span>
+                          <div className="w-14 bg-slate-800 h-1.5 rounded-full overflow-hidden shrink-0">
                             <div
-                              className="bg-sky-500 h-full rounded-full"
+                              className="bg-sky-500 h-full rounded-full transition-all duration-300"
                               style={{ width: `${Math.min(c.cpu_pct || 0, 100)}%` }}
                             />
                           </div>
                         </div>
                       </div>
 
-                      <div>
+                      <div className="w-32 shrink-0">
                         <span className="text-[10px] text-slate-500 block">MEM</span>
-                        <span className="font-semibold">
+                        <span className="font-semibold truncate block" title={`${(c.memory_mb || 0).toFixed(0)} MB (${(c.memory_pct || 0).toFixed(0)}%)`}>
                           {(c.memory_mb || 0).toFixed(0)} MB{' '}
                           <span className="text-slate-500">({(c.memory_pct || 0).toFixed(0)}%)</span>
                         </span>
                       </div>
 
-                      <div>
+                      <div className="w-36 shrink-0">
                         <span className="text-[10px] text-slate-500 block">NET I/O</span>
-                        <span>
+                        <span className="truncate block" title={`${(c.net_input_mb || 0).toFixed(1)}M / ${(c.net_output_mb || 0).toFixed(1)}M`}>
                           {(c.net_input_mb || 0).toFixed(1)}M / {(c.net_output_mb || 0).toFixed(1)}M
                         </span>
                       </div>
                     </div>
 
-                    {/* Right: Actions */}
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      {isRunning ? (
-                        <>
-                          <button
-                            onClick={() => handleContainerOp(c.id, 'restart')}
-                            title="Restart"
-                            className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-colors"
-                          >
-                            <RotateCw className="w-4 h-4" />
-                          </button>
-                          <button
-                            onClick={() => handleContainerOp(c.id, 'stop')}
-                            title="Stop"
-                            className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-amber-400 transition-colors"
-                          >
-                            <Square className="w-4 h-4" />
-                          </button>
-                        </>
-                      ) : (
-                        <button
-                          onClick={() => handleContainerOp(c.id, 'start')}
-                          title="Start"
-                          className="rounded-lg p-2 text-emerald-400 hover:bg-emerald-500/10 transition-colors"
+                    {/* Right: Actions Dropdown */}
+                    <div className="relative shrink-0 flex items-center justify-end" data-dropdown="container-actions">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setOpenActionMenuId(openActionMenuId === c.id ? null : c.id);
+                        }}
+                        title="Container Actions"
+                        className={`flex items-center justify-center w-8 h-8 rounded-lg border transition-all ${
+                          openActionMenuId === c.id
+                            ? 'bg-slate-800 text-slate-100 border-slate-600 shadow-sm'
+                            : 'bg-slate-800/40 text-slate-400 hover:bg-slate-800 hover:text-slate-200 border-slate-800 hover:border-slate-700'
+                        }`}
+                      >
+                        <MoreVertical className="w-4 h-4" />
+                      </button>
+
+                      {openActionMenuId === c.id && (
+                        <div
+                          className="absolute right-0 top-full mt-1.5 z-30 w-44 rounded-xl border border-slate-700/80 bg-slate-900/95 shadow-xl backdrop-blur-md p-1.5 space-y-0.5"
+                          onClick={(e) => e.stopPropagation()}
                         >
-                          <Play className="w-4 h-4" />
-                        </button>
+                          {isRunning ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setOpenActionMenuId(null);
+                                  handleContainerOp(c.id, 'restart');
+                                }}
+                                className="group w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-slate-100 hover:bg-slate-800/80 transition-colors text-left"
+                              >
+                                <RotateCw className="w-4 h-4 text-slate-400 group-hover:text-slate-200 transition-colors" />
+                                <span>Restart</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setOpenActionMenuId(null);
+                                  handleContainerOp(c.id, 'stop');
+                                }}
+                                className="group w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-amber-400 hover:bg-amber-500/10 transition-colors text-left"
+                              >
+                                <Square className="w-4 h-4 text-slate-400 group-hover:text-amber-400 transition-colors" />
+                                <span>Stop</span>
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setOpenActionMenuId(null);
+                                handleContainerOp(c.id, 'start');
+                              }}
+                              className="group w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors text-left"
+                            >
+                              <Play className="w-4 h-4 text-emerald-400 group-hover:text-emerald-300 transition-colors" />
+                              <span>Start</span>
+                            </button>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpenActionMenuId(null);
+                              setLogContainer(c);
+                            }}
+                            className="group w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-sky-400 hover:bg-sky-500/10 transition-colors text-left"
+                          >
+                            <FileText className="w-4 h-4 text-slate-400 group-hover:text-sky-400 transition-colors" />
+                            <span>Live Logs</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpenActionMenuId(null);
+                              setTerminalContainer(c);
+                            }}
+                            className="group w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:text-purple-400 hover:bg-purple-500/10 transition-colors text-left"
+                          >
+                            <Terminal className="w-4 h-4 text-slate-400 group-hover:text-purple-400 transition-colors" />
+                            <span>Terminal</span>
+                          </button>
+
+                          <div className="my-1 border-t border-slate-800" />
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpenActionMenuId(null);
+                              handleContainerOp(c.id, 'remove');
+                            }}
+                            className="group w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors text-left"
+                          >
+                            <Trash2 className="w-4 h-4 text-slate-500 group-hover:text-rose-400 transition-colors" />
+                            <span>Remove</span>
+                          </button>
+                        </div>
                       )}
-
-                      <button
-                        onClick={() => setLogContainer(c)}
-                        title="Live Logs (-f)"
-                        className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-sky-400 transition-colors"
-                      >
-                        <FileText className="w-4 h-4" />
-                      </button>
-
-                      <button
-                        onClick={() => setTerminalContainer(c)}
-                        title="Interactive Shell (Terminal)"
-                        className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-purple-400 transition-colors"
-                      >
-                        <Terminal className="w-4 h-4" />
-                      </button>
-
-                      <button
-                        onClick={() => handleContainerOp(c.id, 'remove')}
-                        title="Remove container"
-                        className="rounded-lg p-2 text-slate-500 hover:bg-rose-500/10 hover:text-rose-400 transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
                     </div>
                   </div>
                 );
@@ -851,7 +1082,12 @@ export const App: React.FC = () => {
         {/* Compose Stacks View */}
         {viewMode === 'stacks' && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {stackList.length === 0 ? (
+            {loading && stackList.length === 0 ? (
+              <div className="col-span-2 py-16 text-center text-slate-400 font-mono text-sm border border-dashed border-slate-800/80 rounded-xl flex flex-col items-center justify-center gap-3">
+                <RefreshCw className="w-5 h-5 text-sky-400 animate-spin" />
+                <span>Loading Compose stacks...</span>
+              </div>
+            ) : stackList.length === 0 ? (
               <div className="col-span-2 py-16 text-center text-slate-500 font-mono text-sm border border-dashed border-slate-800 rounded-xl">
                 No Compose stacks discovered. Click "Scan Directory" to find stacks in {currentHost?.base_dir || '~/docker'}.
               </div>
@@ -1060,19 +1296,9 @@ export const App: React.FC = () => {
         />
       )}
 
-      {showAddHost && (
-        <AddHostModal
-          onClose={() => setShowAddHost(false)}
-          onAdded={(newHost) => {
-            setHosts((prev) => [...prev, newHost]);
-            setSelectedHostId(newHost.id);
-          }}
-        />
-      )}
-
-      {showDeployAgent && (
-        <DeployAgentModal
-          onClose={() => setShowDeployAgent(false)}
+      {showAddClient && (
+        <AddClientModal
+          onClose={() => setShowAddClient(false)}
           hosts={hostList}
           onRefreshHosts={loadHosts}
           onSelectHost={(id) => setSelectedHostId(id)}
@@ -1087,7 +1313,9 @@ export const App: React.FC = () => {
             setHosts((prev) => prev.map((h) => (h.id === updated.id ? updated : h)));
             // Trigger stack discovery for updated path
             api.discoverStacks(updated.id).then((disc) => {
-              if (Array.isArray(disc)) setStacks(disc);
+              if (Array.isArray(disc)) {
+                setStacksByHost((prev) => ({ ...prev, [updated.id]: disc }));
+              }
             }).catch(() => {});
           }}
           onDeleted={(delId) => {
@@ -1100,6 +1328,27 @@ export const App: React.FC = () => {
           }}
         />
       )}
+
+      {/* Bottom Left Version Tag */}
+      <div className="fixed bottom-3.5 left-4 z-30 pointer-events-none select-none">
+        <div
+          title={`DockerPulse v${APP_VERSION}`}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900/90 border border-slate-800/80 backdrop-blur-md text-[11px] font-mono text-slate-400 shadow-lg pointer-events-auto hover:text-slate-200 hover:border-slate-700 transition-colors"
+        >
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-sm shadow-emerald-400/50" />
+          <span>v{APP_VERSION}</span>
+        </div>
+      </div>
+
+      {/* Notifications Left Slide-over Drawer */}
+      <NotificationsDrawer
+        isOpen={showNotificationsDrawer}
+        onClose={() => setShowNotificationsDrawer(false)}
+        notifications={notifications}
+        onDismiss={handleDismissNotification}
+        onDismissAll={handleDismissAllNotifications}
+        onMarkAllRead={handleMarkAllRead}
+      />
     </div>
   );
 };
